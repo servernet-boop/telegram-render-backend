@@ -1,0 +1,141 @@
+# main.py - Telegram Private Backend untuk Render
+import os
+import asyncio
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+CORS(app)  # Izinkan akses dari domain manapun
+
+# Session storage (disimpan di disk untuk Render)
+SESSION_FILE = 'telegram_session.session'
+client = None
+is_authenticated = False
+
+def get_client():
+    """Buat atau ambil client Telegram yang sudah login"""
+    global client, is_authenticated
+    
+    api_id = int(os.environ.get('API_ID', 0))
+    api_hash = os.environ.get('API_HASH', '')
+    
+    if not api_id or not api_hash:
+        logger.error("API_ID or API_HASH not set")
+        return None
+    
+    if client is None:
+        client = TelegramClient(SESSION_FILE, api_id, api_hash)
+    
+    return client
+
+@app.route('/api/status', methods=['GET'])
+def status():
+    """Cek status login"""
+    global is_authenticated
+    return jsonify({
+        'status': 'online',
+        'authenticated': is_authenticated
+    })
+
+@app.route('/api/send-telegram', methods=['POST'])
+def send_telegram():
+    """Endpoint utama untuk kirim pesan"""
+    global is_authenticated
+    
+    try:
+        data = request.json
+        phone = data.get('phone')
+        message = data.get('message')
+        code = data.get('code')
+        password = data.get('password')
+        
+        logger.info(f"Request from {phone}")
+        
+        # Dapatkan client
+        client = get_client()
+        if client is None:
+            return jsonify({
+                'status': 'error',
+                'error': 'API_ID/API_HASH not configured'
+            }), 500
+        
+        async def handle_telegram():
+            await client.connect()
+            
+            # Cek apakah sudah login
+            if not await client.is_user_authorized():
+                if code:
+                    # Kirim kode verifikasi
+                    try:
+                        await client.sign_in(phone, code)
+                        logger.info("✅ Login successful with code")
+                        is_authenticated = True
+                    except SessionPasswordNeededError:
+                        # 2FA enabled
+                        if password:
+                            await client.sign_in(password=password)
+                            logger.info("✅ Login successful with 2FA")
+                            is_authenticated = True
+                        else:
+                            return {
+                                'status': 'need_password',
+                                'message': '2FA required'
+                            }
+                else:
+                    # Minta kode verifikasi
+                    await client.send_code_request(phone)
+                    logger.info("📱 Verification code sent")
+                    return {
+                        'status': 'need_code',
+                        'message': 'Verification code sent'
+                    }
+            
+            # Kirim pesan ke Saved Messages
+            if await client.is_user_authorized():
+                await client.send_message('me', message)
+                logger.info("✅ Message sent to Saved Messages")
+                is_authenticated = True
+                return {
+                    'status': 'success',
+                    'message': 'Pesan berhasil dikirim!'
+                }
+            
+            return {
+                'status': 'error',
+                'message': 'Not authenticated'
+            }
+        
+        # Jalankan async function
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(handle_telegram())
+        loop.close()
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"❌ Error: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        'name': 'Telegram Private Backend',
+        'status': 'running',
+        'endpoints': ['/api/status', '/api/send-telegram'],
+        'docs': 'POST to /api/send-telegram with phone, message, code/password'
+    })
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
